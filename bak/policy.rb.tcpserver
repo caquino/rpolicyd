@@ -1,0 +1,268 @@
+#!/usr/bin/env ruby
+# Postfix policy delegation daemon
+# Authors: Cassiano Aquino <caquino@ebrain.com.br> / Lucas Fontes <lucas@dimension.com.br>
+# 05/2008
+# Version: 0.1
+
+require 'rubygems'
+require 'rake'
+require 'socket'
+require 'optparse'
+require 'ostruct'
+require 'pp'
+require 'fcntl'
+require 'memcached'
+require 'net/geoip'
+require 'thread'
+require 'singleton'
+require 'spf4r'
+require 'relayd4r'
+require 'IPTools'
+
+
+FILTERDIR='./plugins'
+CACHE = Memcached.new('127.0.0.1:11211')
+COUNTRY = Net::GeoIP.open('/usr/share/GeoIP/GeoIP.dat', Net::GeoIP::TYPE_RAM)
+RELAYD = Relayd.new()
+IPTOOLS = IPTools.new()
+
+class Logger
+
+	include Singleton
+	#session log
+
+	def info(string, session="")
+		puts string
+		STDOUT.flush
+	end
+
+	def debug(string, session="")
+		  print Time.now.strftime("[%a %b %e %H:%M:%S %Y] ") + "#{session} #{string}\n"
+			STDOUT.flush
+	end
+
+end
+
+class GeoIP
+	
+	include Singleton
+
+	def check(map)
+		COUNTRY.country_code_by_addr(map['client_address'])
+	end
+
+end
+
+class SPFCheck
+	include Singleton
+
+	def check(map)
+		SPF.new.query(map) 
+	end
+
+end
+
+
+class Greylist
+
+	include Singleton
+
+	def phase1(map)
+		retcode=true
+		namespace='glist'
+		key="#{namespace}#{map['sender']}-#{map['recipient']}-#{map['client_address']}"
+		begin
+    	gl1 = CACHE.get "gl1-#{key}"
+			retcode=false
+		rescue Memcached::NotFound => ex
+			retcode=true
+		end
+		return retcode
+	end
+
+
+	def check(map)
+		retcode=false
+		namespace='glist'
+		key="#{namespace}#{map['sender']}-#{map['recipient']}-#{map['client_address']}"
+		begin
+    	gl1 = CACHE.get "gl1-#{key}"
+		rescue Memcached::NotFound => ex
+			gl1 = nil
+		end
+		begin
+			gl2 = CACHE.get "gl2-#{key}"
+		rescue Memcached::NotFound => ex
+			gl2 = nil
+		end
+		begin
+			gl3 = CACHE.get "gl3-#{key}"
+		rescue Memcached::NotFound => ex
+			gl3 = nil
+		end
+	  if gl1.nil? and gl2.nil? and gl3.nil? 
+	      CACHE.set "gl1-#{key}", map, 300 
+	      CACHE.set "gl2-#{key}", map, 86400 
+				retcode=false
+	  else
+	    if not gl1.nil?
+			 	retcode=false
+	    elsif not gl3.nil?
+	      CACHE.delete "gl3-#{key}" 
+	      CACHE.set "gl3-#{key}", map, 1296000 
+				retcode=true
+	    elsif not gl2.nil?
+	 			CACHE.delete "gl2-#{key}" 
+	      CACHE.set "gl3-#{key}", map, 1296000 
+				retcode=true
+	    end
+		end
+		retcode
+	 end
+
+end
+
+
+class PSession
+
+	def initialize(session)
+		@session = session
+		@processed=0
+		@port = session.peeraddr[1]
+		@name = session.peeraddr[2]
+		@addr = session.peeraddr[3]
+		Dir["#{FILTERDIR}/*.rb"].each{|x| load x}
+		@start = Time.now
+		Logger.instance.debug("C=#{@addr}:#{@port}")
+	end
+  
+	def run()
+		map = {}
+		begin
+			while (buffer = @session.gets("\n"))
+				action_prefix="action="
+				action="DUNNO"
+				buffer = buffer.chomp
+				if (buffer.size) > 0 && buffer.index('=')
+					key, value = buffer.split('=')
+					map[key] = value
+				elsif map.length > 0
+					@processed +=1
+					Plugin.registered_plugins.sort.each do |@key, @plugin|
+						Logger.instance.debug("Running #{@key}")
+						pluginreturn=@plugin.process map
+						Logger.instance.debug("Ending #{@key}")
+						action = pluginreturn if pluginreturn
+						break unless pluginreturn.nil?
+					end
+					@session.puts("#{action_prefix}#{action}\r\n")
+				end
+			end #while
+		rescue Exception => ex
+			Logger.instance.info("#{ex.class}: #{ex.message}\n\t#{ex.backtrace}")
+		ensure
+			@finish = Time.now - @start
+			Logger.instance.debug("D=#{@addr}:#{@port} M=#{@processed} T=#{@finish}")
+			@session.close unless @session.closed?
+		end
+	end
+  
+end
+
+
+class OptParse
+
+	def self.parse(args)
+		options = OpenStruct.new
+		options.port = 8888 
+		options.listen = '127.0.0.1'
+		options.verbose = false
+
+		opts = OptionParser.new do |opts|
+			opts.banner = "Usage: policy.rb [options]"
+			opts.separator ""
+			opts.separator "Specific options:"
+
+			opts.on("-v", "--[no-]verbose", "Run verbosely") do |v|
+				options.verbose = v
+			end
+
+			opts.on("-p", "--port N", Float, "Define TCP port to listen") do |v|
+				options.port = v
+			end
+
+			opts.on("-l", "--listen N", "Define the IP address to listen") do |v|
+				options.listen = v
+			end
+
+		end
+		opts.parse!(args)
+		options
+	end  
+
+end  
+
+module PluginSugar
+  def def_field(*names)
+    class_eval do 
+      names.each do |name|
+        define_method(name) do |*args| 
+          case args.size
+          when 0: instance_variable_get("@#{name}")
+          else    instance_variable_set("@#{name}", *args)
+          end
+        end
+      end
+    end
+  end
+end
+
+
+class Plugin
+	@registered_plugins = {}
+
+	class << self
+		attr_reader :registered_plugins
+		private :new
+	end
+
+	def self.define(name,&block)
+		p = new
+		p.instance_eval(&block)
+		p.init
+		Plugin.registered_plugins[name] = p
+	end
+
+	extend PluginSugar
+	def_field :author, :version, :type
+end
+
+class PDPHandler
+
+	def initialize(host, port)
+		@port = port
+		@host = host
+	end
+
+	def start
+		@server = TCPServer.new(@host,@port)
+		Logger.instance.debug("Starting the main loop")
+		while true
+		  session = @server.accept
+			Thread.new(PSession.new(session)) do |ts| 
+			  ts.run()
+		  end
+		end
+	end
+
+end
+
+def main
+	options = OptParse.parse(ARGV)
+	Logger.instance.debug("Starting listening on #{options.listen} port #{options.port}")
+
+	PDPHandler.new(options.listen,options.port).start
+end
+
+
+main if $0 == __FILE__
